@@ -12,7 +12,8 @@ gi.require_version('Gst', '1.0')
 gi.require_version('GstBase', '1.0')
 gi.require_version('GstWebRTC', '1.0')
 gi.require_version('GstSdp', '1.0')
-from gi.repository import Gst, GObject, GstWebRTC, GstSdp
+gi.require_version('GstPbutils', '1.0')  # Required for encoding profiles
+from gi.repository import Gst, GObject, GstWebRTC, GstSdp, GstPbutils
 
 from .http_server import WebRTCHTTPHandler
 from .signaling import SignalingServer
@@ -101,21 +102,77 @@ class WebRTCWebSink(Gst.Bin, GObject.Object):
         self.ws_port = 8081
         self.bind_address = '0.0.0.0'
         self.stun_server = 'stun://stun.l.google.com:19302'
-        self.video_codec = 'vp8'
+        self.video_codec = 'vp8'  # Match the default in __gproperties__
 
         # Initialize state
         self.http_server = None
         self.http_thread = None
         self.signaling = None
         self.signaling_thread = None
-        self.encoder = None
-        self.payloader = None
+        self.encodebin = None
         self.convert = None
         self.tee = None
         self.servers_started = False
+        self.payloader = None
 
         # Create internal elements
         self.setup_pipeline()
+
+    def find_best_encoder(self, codec_name):
+        """Find the highest-ranked encoder element that can produce the specified codec."""
+        # Map codec names to their corresponding GStreamer caps
+        logger.info(f"Finding best encoder for codec: {codec_name}")
+        codec_caps = {
+            'vp8': 'video/x-vp8',
+            'h264': 'video/x-h264',
+            'vp9': 'video/x-vp9',
+            'av1': 'video/x-av1',
+        }
+
+        if codec_name not in codec_caps:
+            logger.error(f"Unsupported codec: {codec_name}, falling back to vp8")
+            return None, None
+
+        target_caps = Gst.Caps.from_string(codec_caps[codec_name])
+
+        # Find all encoder elements
+        encoder_factories = []
+        registry = Gst.Registry.get()
+        factories = registry.get_feature_list(Gst.ElementFactory)
+        for factory in factories:
+            if ('encoder' in factory.get_name() or 'enc' in factory.get_name()) and 'encoder' in factory.get_metadata('klass').lower():
+                # Check if this encoder can produce our target format
+                for template in factory.get_static_pad_templates():
+                    if template.direction == Gst.PadDirection.SRC:
+                        template_caps = template.get_caps()
+                        if template_caps.can_intersect(target_caps):
+                            encoder_factories.append(factory)
+                            break
+
+        # Sort by rank
+        encoder_factories.sort(key=lambda x: x.get_rank(), reverse=True)
+
+        if not encoder_factories:
+            logger.error(f"No encoder found for codec {codec_name}, falling back to vp8")
+            if codec_name != 'vp8':
+                return self.find_best_encoder('vp8')
+            return None, None
+
+        # Find matching payloader based on encoder name and codec
+        best_encoder = encoder_factories[0]
+        encoder_name = best_encoder.get_name()
+        logger.info(f"Selected encoder: {encoder_name} (rank: {best_encoder.get_rank()})")
+
+        # Determine payloader based on codec
+        payloader_map = {
+            'vp8': 'rtpvp8pay',
+            'h264': 'rtph264pay',
+            'vp9': 'rtpvp9pay',
+            'av1': 'rtpav1pay'
+        }
+        payloader = payloader_map.get(codec_name)
+
+        return encoder_name, payloader
 
     def setup_pipeline(self):
         """Set up the internal GStreamer pipeline."""
@@ -125,14 +182,25 @@ class WebRTCWebSink(Gst.Bin, GObject.Object):
             raise Exception("Could not create videoconvert")
 
         # Create encoding elements based on video-codec property
-        if self.video_codec == 'vp8':
-            self.encoder = Gst.ElementFactory.make('vp8enc', 'encoder')
-            self.payloader = Gst.ElementFactory.make('rtpvp8pay', 'payloader')
-        elif self.video_codec == 'h264':
-            self.encoder = Gst.ElementFactory.make('x264enc', 'encoder')
-            self.payloader = Gst.ElementFactory.make('rtph264pay', 'payloader')
-        else:
-            raise Exception(f"Unsupported video codec: {self.video_codec}")
+        # Find best encoder and payloader for selected codec
+        encoder_name, payloader_name = self.find_best_encoder(self.video_codec)
+        if not encoder_name or not payloader_name:
+            # If we can't find an encoder for the requested codec, try vp8 as a fallback
+            logger.error(f"Could not find encoder/payloader for codec {self.video_codec}")
+            self.video_codec = 'vp8'
+            encoder_name, payloader_name = self.find_best_encoder('vp8')
+            if not encoder_name or not payloader_name:
+                # If we still can't find an encoder, raise an exception
+                raise Exception("Could not find any suitable video encoder")
+
+        # Create encoding elements
+        self.encoder = Gst.ElementFactory.make(encoder_name, 'encoder')
+        if not self.encoder:
+            raise Exception(f"Could not create encoder {encoder_name}")
+
+        self.payloader = Gst.ElementFactory.make(payloader_name, 'payloader')
+        if not self.payloader:
+            raise Exception(f"Could not create payloader {payloader_name}")
 
         # Configure elements
         if self.video_codec == 'h264':
@@ -262,6 +330,8 @@ class WebRTCWebSink(Gst.Bin, GObject.Object):
             # This will apply to new WebRTCbins created
         elif prop.name == 'video-codec':
             self.video_codec = value
+            # The new codec will be used when creating new WebRTCbins
+            logger.info(f"Video codec set to {self.video_codec}, will be used for new connections")
         else:
             raise AttributeError(f'Unknown property {prop.name}')
 

@@ -69,7 +69,13 @@ def main():
         if not sink:
             print("Failed to find webrtcwebsink element", file=sys.stderr)
             sys.exit(1)
-        print("Successfully got sink element")
+
+        # Set video codec property to test dynamic encoder selection
+        print("Setting video codec to h264...")
+        sink.set_property('video-codec', 'h264')
+        print(f"Video codec set to: {sink.get_property('video-codec')}")
+
+        print("Successfully configured sink element")
 
         # Create GLib main loop
         loop = GLib.MainLoop()
