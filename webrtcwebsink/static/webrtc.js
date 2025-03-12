@@ -38,6 +38,43 @@ function initVideo() {
     videoElement.muted = true;  // Mute to allow autoplay
 }
 
+// Detect supported codecs
+async function detectSupportedCodecs() {
+    try {
+        const codecs = [
+            { name: 'h264', mimeType: 'video/h264' },
+            { name: 'vp8', mimeType: 'video/VP8' },
+            { name: 'vp9', mimeType: 'video/VP9' },
+            { name: 'av1', mimeType: 'video/AV1' }
+        ];
+
+        // Check which codecs are supported
+        const supportedCodecs = [];
+        for (const codec of codecs) {
+            if (RTCRtpReceiver.getCapabilities) {
+                const capabilities = RTCRtpReceiver.getCapabilities('video');
+                const supported = capabilities.codecs.some(c =>
+                    c.mimeType.toLowerCase() === codec.mimeType.toLowerCase());
+                if (supported) {
+                    supportedCodecs.push(codec.name);
+                }
+            } else {
+                // Fallback for browsers without getCapabilities
+                supportedCodecs.push(codec.name);
+            }
+        }
+
+        console.log('Supported codecs:', supportedCodecs);
+
+        // Prefer h264 if supported, otherwise use the first supported codec
+        return supportedCodecs.includes('h264') ? 'h264' :
+               (supportedCodecs.length > 0 ? supportedCodecs[0] : 'vp8');
+    } catch (error) {
+        console.warn('Error detecting codecs:', error);
+        return 'vp8'; // Default to VP8 if detection fails
+    }
+}
+
 function createPeerConnection() {
     if (pc) {
         console.log('Closing existing peer connection');
@@ -174,6 +211,16 @@ async function start() {
                 if (msg.startsWith('ROOM_OK')) {
                     console.log('Got ROOM OK from signaling server');
                     setStatus('Joined WebRTC room, waiting for stream...');
+
+                    // Detect and send preferred codec
+                    try {
+                        const preferredCodec = await detectSupportedCodecs();
+                        // Always send h264 to match server configuration
+                        console.log('Detected codec:', preferredCodec, 'but forcing h264');
+                        ws.send(`CODEC h264`);
+                    } catch (error) {
+                        console.warn('Error sending codec preference:', error);
+                    }
                     return;
                 }
 

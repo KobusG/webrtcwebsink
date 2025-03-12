@@ -8,7 +8,8 @@ import os
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib, GObject
 
-# os.environ['GST_DEBUG'] = '4'
+# Enable more verbose logging
+os.environ['GST_DEBUG'] = '4,webrtcwebsink:7'
 Gst.init(None)
 
 import webrtcwebsink
@@ -48,10 +49,10 @@ def main():
 
     # Create the pipeline
     pipeline_str = '''
-        videotestsrc is-live=true !
+        videotestsrc is-live=true pattern=ball !
         videoconvert !
         video/x-raw,format=RGBA,width=640,height=480,framerate=30/1 !
-        queue !
+        queue max-size-buffers=2 leaky=downstream !
         webrtcwebsink name=sink
     '''
 

@@ -12,6 +12,9 @@ from gi.repository import Gst, GObject, GstWebRTC, GstSdp
 # Configure logging
 logger = logging.getLogger('webrtcwebsink.signaling')
 
+# Enable more verbose logging for debugging
+logger.setLevel(logging.DEBUG)
+
 class SignalingServer:
     def __init__(self, webrtcbin_factory, host='0.0.0.0', port=8081):
         self.webrtcbin_factory = webrtcbin_factory
@@ -93,7 +96,7 @@ class SignalingServer:
         try:
             # Wait for HELLO
             hello = await websocket.recv()
-            logger.debug(f"Received initial message: {hello}")
+            logger.info(f"Received initial message from client {client_id}: {hello}")
             if not hello.startswith('HELLO'):
                 logger.warning("Invalid hello message")
                 await websocket.close(code=1002, reason='invalid protocol')
@@ -101,11 +104,11 @@ class SignalingServer:
 
             # Send back HELLO
             await websocket.send('HELLO')
-            logger.debug("Sent HELLO response")
+            logger.info("Sent HELLO response to client {client_id}")
 
             # Wait for ROOM command
             room_cmd = await websocket.recv()
-            logger.debug(f"Received room command: {room_cmd}")
+            logger.info(f"Received room command from client {client_id}: {room_cmd}")
             if not room_cmd.startswith('ROOM'):
                 logger.warning("Invalid room command")
                 await websocket.close(code=1002, reason='invalid protocol')
@@ -113,10 +116,27 @@ class SignalingServer:
 
             # Send ROOM_OK
             await websocket.send('ROOM_OK')
-            logger.debug("Sent ROOM_OK")
+            logger.info(f"Sent ROOM_OK to client {client_id}")
+
+            # Default codec preference
+            codec_preference = None
+
+            # Wait for optional codec preference
+            try:
+                codec_msg = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                if codec_msg.startswith('CODEC'):
+                    codec_preference = codec_msg.split(' ')[1].strip().lower()
+                    logger.info(f"Client {client_id} requested codec: {codec_preference}")
+                    # Force H.264 if the server is configured to use it
+                    old_codec = codec_preference
+                    logger.info(f"Forcing codec for client {client_id} from {old_codec} to h264")
+                    if codec_preference != 'h264':
+                        codec_preference = 'h264'
+            except asyncio.TimeoutError:
+                logger.debug(f"No codec preference received from client {client_id}")
 
             # Create a new WebRTCbin for this client
-            webrtcbin = self.webrtcbin_factory()
+            webrtcbin = self.webrtcbin_factory(client_id, codec_preference)
             if not webrtcbin:
                 logger.error(f"Failed to create WebRTCbin for client {client_id}")
                 await websocket.close(code=1011, reason='internal server error')

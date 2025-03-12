@@ -22,6 +22,9 @@ from .signaling import SignalingServer
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('webrtcwebsink.plugin')
 
+# Enable more verbose logging for debugging
+logging.getLogger('webrtcwebsink').setLevel(logging.DEBUG)
+
 # Define the GObject type
 class WebRTCWebSink(Gst.Bin, GObject.Object):
     """
@@ -118,6 +121,9 @@ class WebRTCWebSink(Gst.Bin, GObject.Object):
         # Create internal elements
         self.setup_pipeline()
 
+        # Dictionary to store client codec preferences
+        self.client_codecs = {}
+
     def find_best_encoder(self, codec_name):
         """Find the highest-ranked encoder element that can produce the specified codec."""
         # Map codec names to their corresponding GStreamer caps
@@ -176,63 +182,33 @@ class WebRTCWebSink(Gst.Bin, GObject.Object):
 
     def setup_pipeline(self):
         """Set up the internal GStreamer pipeline."""
-        # Create elements
+        # Create videoconvert element
         self.convert = Gst.ElementFactory.make('videoconvert', 'convert')
         if not self.convert:
             raise Exception("Could not create videoconvert")
 
-        # Create encoding elements based on video-codec property
-        # Find best encoder and payloader for selected codec
-        encoder_name, payloader_name = self.find_best_encoder(self.video_codec)
-        if not encoder_name or not payloader_name:
-            # If we can't find an encoder for the requested codec, try vp8 as a fallback
-            logger.error(f"Could not find encoder/payloader for codec {self.video_codec}")
-            self.video_codec = 'vp8'
-            encoder_name, payloader_name = self.find_best_encoder('vp8')
-            if not encoder_name or not payloader_name:
-                # If we still can't find an encoder, raise an exception
-                raise Exception("Could not find any suitable video encoder")
-
-        # Create encoding elements
-        self.encoder = Gst.ElementFactory.make(encoder_name, 'encoder')
-        if not self.encoder:
-            raise Exception(f"Could not create encoder {encoder_name}")
-
-        self.payloader = Gst.ElementFactory.make(payloader_name, 'payloader')
-        if not self.payloader:
-            raise Exception(f"Could not create payloader {payloader_name}")
-
-        # Configure elements
-        if self.video_codec == 'h264':
-            self.encoder.set_property('tune', 'zerolatency')
-            self.encoder.set_property('speed-preset', 'ultrafast')
-            self.payloader.set_property('config-interval', -1)
-            self.payloader.set_property('aggregate-mode', 'zero-latency')
-
-        # Create tee to split the stream for multiple clients
+        # Create tee element to split the stream for multiple clients
         self.tee = Gst.ElementFactory.make('tee', 'tee')
         if not self.tee:
             raise Exception("Could not create tee")
         self.tee.set_property('allow-not-linked', True)  # Important for dynamic clients
 
-        # Add elements to bin
+        # Add elements to bin and link them
+        # Note: Each client will have its own encoder and payloader
         self.add(self.convert)
-        self.add(self.encoder)
-        self.add(self.payloader)
         self.add(self.tee)
 
-        # Link elements
-        self.convert.link(self.encoder)
-        self.encoder.link(self.payloader)
-        self.payloader.link(self.tee)
+        # Link convert directly to tee
+        # Each client will get its own branch from the tee with encoder and payloader
+        self.convert.link(self.tee)
 
         # Create sink pad
         self.sink_pad = Gst.GhostPad.new('sink', self.convert.get_static_pad('sink'))
         self.add_pad(self.sink_pad)
 
-    def create_webrtcbin(self):
+    def create_webrtcbin(self, client_id=None, codec_preference=None, **kwargs):
         """Create a new WebRTCbin for a client connection."""
-        logger.info("Creating new WebRTCbin")
+        logger.info(f"Creating new WebRTCbin for client {client_id} with codec preference {codec_preference}")
 
         # Create a new webrtcbin
         webrtcbin = Gst.ElementFactory.make('webrtcbin', None)
@@ -241,7 +217,45 @@ class WebRTCWebSink(Gst.Bin, GObject.Object):
             return None
 
         # Configure the webrtcbin
+        logger.debug(f"Setting STUN server to {self.stun_server}")
         webrtcbin.set_property('stun-server', self.stun_server)
+
+        # Handle client codec preference
+        codec_to_use = self.video_codec  # Default
+        if client_id is not None and codec_preference is not None:
+            logger.info(f"Client {client_id} prefers codec: {codec_preference}")
+            self.client_codecs[client_id] = codec_preference
+            codec_to_use = codec_preference
+        else:
+            logger.info(f"No codec preference for client {client_id}, using default: {self.video_codec}")
+
+        # Create encoder and payloader for this client's preferred codec
+        encoder_name, payloader_name = self.find_best_encoder(codec_to_use)
+        logger.info(f"Using encoder {encoder_name} and payloader {payloader_name} for codec {codec_to_use} for client {client_id}")
+        if not encoder_name or not payloader_name:
+            logger.warning(f"Could not find encoder for {codec_to_use}, falling back to default")
+            encoder_name, payloader_name = self.find_best_encoder(self.video_codec)
+            if not encoder_name or not payloader_name:
+                logger.error("Could not find any suitable encoder")
+                webrtcbin.set_state(Gst.State.NULL)
+                self.remove(webrtcbin)
+                return None
+
+        # Create encoder and payloader elements for this client
+        encoder = Gst.ElementFactory.make(encoder_name, f'encoder-{client_id}')
+        if not encoder:
+            logger.error(f"Could not create encoder {encoder_name}")
+            webrtcbin.set_state(Gst.State.NULL)
+            self.remove(webrtcbin)
+            return None
+
+        payloader = Gst.ElementFactory.make(payloader_name, f'payloader-{client_id}')
+        if not payloader:
+            logger.error(f"Could not create payloader {payloader_name}")
+            encoder.set_state(Gst.State.NULL)
+            webrtcbin.set_state(Gst.State.NULL)
+            self.remove(webrtcbin)
+            return None
 
         # Add it to our bin
         self.add(webrtcbin)
@@ -258,6 +272,10 @@ class WebRTCWebSink(Gst.Bin, GObject.Object):
         # Add the queue to our bin
         self.add(queue)
 
+        # Add encoder and payloader to our bin
+        self.add(encoder)
+        self.add(payloader)
+
         # Get a source pad from the tee
         tee_src_pad = self.tee.get_request_pad("src_%u")
         if not tee_src_pad:
@@ -265,6 +283,8 @@ class WebRTCWebSink(Gst.Bin, GObject.Object):
             queue.set_state(Gst.State.NULL)
             webrtcbin.set_state(Gst.State.NULL)
             self.remove(queue)
+            self.remove(encoder)
+            self.remove(payloader)
             self.remove(webrtcbin)
             return None
 
@@ -279,27 +299,109 @@ class WebRTCWebSink(Gst.Bin, GObject.Object):
             self.tee.release_request_pad(tee_src_pad)
             queue.set_state(Gst.State.NULL)
             webrtcbin.set_state(Gst.State.NULL)
+            self.remove(encoder)
+            self.remove(payloader)
             self.remove(queue)
             self.remove(webrtcbin)
             return None
 
-        # Link the queue to the webrtcbin
-        ret = queue.link(webrtcbin)
+        # Link the queue to the encoder to the payloader to the webrtcbin
+        ret = queue.link(encoder)
         if not ret:
-            logger.error("Failed to link queue to webrtcbin")
+            logger.error("Failed to link queue to encoder")
             tee_src_pad.unlink(queue_sink_pad)
             self.tee.release_request_pad(tee_src_pad)
             queue.set_state(Gst.State.NULL)
+            encoder.set_state(Gst.State.NULL)
+            payloader.set_state(Gst.State.NULL)
             webrtcbin.set_state(Gst.State.NULL)
             self.remove(queue)
+            self.remove(encoder)
+            self.remove(payloader)
+            self.remove(webrtcbin)
+            return None
+
+        ret = encoder.link(payloader)
+        if not ret:
+            logger.error("Failed to link encoder to payloader")
+            tee_src_pad.unlink(queue_sink_pad)
+            self.tee.release_request_pad(tee_src_pad)
+            queue.set_state(Gst.State.NULL)
+            encoder.set_state(Gst.State.NULL)
+            payloader.set_state(Gst.State.NULL)
+            webrtcbin.set_state(Gst.State.NULL)
+            self.remove(queue)
+            self.remove(encoder)
+            self.remove(payloader)
+            self.remove(webrtcbin)
+            return None
+
+        ret = payloader.link(webrtcbin)
+        if not ret:
+            logger.error("Failed to link payloader to webrtcbin")
+            tee_src_pad.unlink(queue_sink_pad)
+            self.tee.release_request_pad(tee_src_pad)
+            queue.set_state(Gst.State.NULL)
+            encoder.set_state(Gst.State.NULL)
+            payloader.set_state(Gst.State.NULL)
+            webrtcbin.set_state(Gst.State.NULL)
+            self.remove(queue)
+            self.remove(encoder)
+            self.remove(payloader)
             self.remove(webrtcbin)
             return None
 
         # Sync the element states with the parent
         queue.sync_state_with_parent()
+        encoder.sync_state_with_parent()
+        payloader.sync_state_with_parent()
         webrtcbin.sync_state_with_parent()
 
-        logger.info("Successfully created and linked WebRTCbin")
+        # Configure codec-specific settings
+        if codec_to_use == 'h264':
+            # Configure H.264 encoder for low latency
+            try:
+                # Configure x264enc
+                if 'x264' in encoder_name:
+                    # encoder.set_property('tune', 'zerolatency')
+                    # encoder.set_property('speed-preset', 'ultrafast')
+                    encoder.set_property('key-int-max', 30)  # Keyframe every 1 second at 30fps
+                    encoder.set_property('bitrate', 2000)    # 2 Mbps
+                    logger.info(f"Configured {encoder_name} with low-latency settings")
+                # Configure nvh264enc (NVIDIA)
+                elif 'nvh264' in encoder_name:
+                    try:
+                        encoder.set_property('preset', 'low-latency')
+                    except Exception as e:
+                        logger.warning(f"Could not set preset property on {encoder_name}: {e}")
+                        # Try alternative properties for older NVIDIA encoder versions
+                        encoder.set_property('rc-mode', 'cbr')  # Constant bitrate for low latency
+                    encoder.set_property('zerolatency', True)
+                    logger.info(f"Configured {encoder_name} with low-latency settings")
+                # Configure vaapih264enc (Intel)
+                elif 'vaapi' in encoder_name:
+                    try:
+                        encoder.set_property('rate-control', 'cbr')
+                        encoder.set_property('bitrate', 2000)  # 2 Mbps
+                    except Exception as e:
+                        logger.warning(f"Could not set all properties on {encoder_name}: {e}")
+                    # Set low latency properties
+                    encoder.set_property('keyframe-period', 30)  # Keyframe every 1 second at 30fps
+                    logger.info(f"Configured {encoder_name} with low-latency settings")
+            except Exception as e:
+                logger.warning(f"Could not set all properties on H.264 encoder: {e}")
+            payloader.set_property('config-interval', -1)
+            payloader.set_property('aggregate-mode', 'zero-latency')
+
+        logger.info(f"Successfully created and linked WebRTCbin with codec {codec_to_use} for client {client_id}")
+
+        # Add a probe to the payloader source pad to monitor the data flow
+        payloader_src_pad = payloader.get_static_pad('src')
+        if payloader_src_pad:
+            payloader_src_pad.add_probe(Gst.PadProbeType.BUFFER,
+                                        lambda pad, info: logger.debug(f"Data flowing through payloader for codec {codec_to_use}") or Gst.PadProbeReturn.OK,
+                                        None)
+
         return webrtcbin
 
     def do_get_property(self, prop):
@@ -330,8 +432,7 @@ class WebRTCWebSink(Gst.Bin, GObject.Object):
             # This will apply to new WebRTCbins created
         elif prop.name == 'video-codec':
             self.video_codec = value
-            # The new codec will be used when creating new WebRTCbins
-            logger.info(f"Video codec set to {self.video_codec}, will be used for new connections")
+            logger.info(f"Default video codec set to {self.video_codec}, will be used for new connections without specific preferences")
         else:
             raise AttributeError(f'Unknown property {prop.name}')
 
