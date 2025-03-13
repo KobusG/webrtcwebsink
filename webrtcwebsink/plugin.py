@@ -4,7 +4,8 @@ import asyncio
 import threading
 import time
 import logging
-from http.server import HTTPServer
+import aiohttp.web
+# from http.server import HTTPServer
 import socket
 from termcolor import colored
 from urllib.parse import quote
@@ -112,6 +113,7 @@ class WebRTCWebSink(Gst.Bin, GObject.Object):
         # Initialize state
         self.http_server = None
         self.http_thread = None
+        self.ssl_context = None
         self.signaling = None
         self.signaling_thread = None
         self.encoder = None
@@ -355,13 +357,13 @@ class WebRTCWebSink(Gst.Bin, GObject.Object):
         else:
             raise AttributeError(f'Unknown property {prop.name}')
 
-    def handle_message(self, message):
-        """Handle GStreamer messages."""
-        if message.type == Gst.MessageType.ERROR:
-            error, debug = message.parse_error()
-            logger.error(f"Error: {error.message}")
-            logger.debug(f"Debug info: {debug}")
-        return Gst.Bin.handle_message(self, message)
+    # def handle_message(self, message):
+    #     """Handle GStreamer messages."""
+    #     if message.type == Gst.MessageType.ERROR:
+    #         error, debug = message.parse_error()
+    #         logger.error(f"Error: {error.message}")
+    #         logger.debug(f"Debug info: {debug}")
+    #     return Gst.Bin.handle_message(self, message)
 
     def do_change_state(self, transition):
         """Handle state changes."""
@@ -382,26 +384,40 @@ class WebRTCWebSink(Gst.Bin, GObject.Object):
 
         return Gst.Bin.do_change_state(self, transition)
 
+    def run_http_server(self, runner):
+        """Run the HTTP server."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(runner.setup())
+        site = aiohttp.web.TCPSite(runner, self.bind_address, self.port)
+        loop.run_until_complete(site.start())
+        loop.run_forever()
+
     def start_servers(self):
         """Start the HTTP and WebSocket servers."""
         # Create HTTP server socket with address reuse
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.bind_address, self.port))
-        sock.listen(1)
+        # sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # sock.bind((self.bind_address, self.port))
+        # sock.listen(1)
 
         # Create HTTP server with the bound socket
         # Set the WebSocket port in the handler class
         WebRTCHTTPHandler.ws_port = self.ws_port
 
-        self.http_server = HTTPServer(
-            (self.bind_address, self.port),
-            WebRTCHTTPHandler,
-            bind_and_activate=False
-        )
-        self.http_server.socket = sock
+        # self.http_server = HTTPServer(
+        #     (self.bind_address, self.port),
+        #     WebRTCHTTPHandler,
+        #     bind_and_activate=False
+        # )
+        # self.http_server.socket = sock
 
-        self.http_thread = threading.Thread(target=self.http_server.serve_forever)
+        self.http_server = aiohttp.web.Application()
+        self.http_server.router.add_get('/', lambda r: aiohttp.web.FileResponse(os.path.join(os.path.dirname(__file__), 'static', 'index.html')))
+        self.http_server.router.add_get('/api/config', lambda r: aiohttp.web.json_response({'ws_port': self.ws_port}))
+        self.http_server.router.add_static('/', os.path.join(os.path.dirname(__file__), 'static'))
+        runner = aiohttp.web.AppRunner(self.http_server)
+        self.http_thread = threading.Thread(target=self.run_http_server, args=(runner,))
         self.http_thread.daemon = True
         self.http_thread.start()
 

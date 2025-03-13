@@ -17,6 +17,7 @@ dependencies = [
     "pygobject",
     "termcolor",
     "requests",
+    "aiohttp",
 ]
 
 [tool.setuptools]
