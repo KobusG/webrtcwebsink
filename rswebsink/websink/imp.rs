@@ -30,6 +30,7 @@ static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
     gst::DebugCategory::new(
         "websink",
         gst::DebugColorFlags::empty(),
+
         Some("webrtc streaming sink element"),
     )
 });
@@ -161,37 +162,19 @@ impl ObjectImpl for WebSink {
             "port" => {
                 let mut settings = self.settings.lock().unwrap();
                 let port = value.get::<u32>().expect("type checked upstream") as u16;
-                gst::info!(
-                    CAT,
-                    "Changing port from {} to {}",
-                    settings.port,
-                    port
-                );
+                gst::info!(CAT, "Changing port from {} to {}", settings.port, port);
                 settings.port = port;
             }
             "stun-server" => {
                 let mut settings = self.settings.lock().unwrap();
-                let stun_server = value
-                    .get::<Option<String>>()
-                    .expect("type checked upstream")
-                    .unwrap_or_else(|| DEFAULT_STUN_SERVER.to_string());
-                gst::info!(
-                    CAT,
-                    "Changing stun-server from {} to {}",
-                    settings.stun_server,
-                    stun_server
-                );
+                let stun_server = value.get::<Option<String>>().expect("type checked upstream").unwrap_or_else(|| DEFAULT_STUN_SERVER.to_string());
+                gst::info!(CAT, "Changing stun-server from {} to {}", settings.stun_server, stun_server);
                 settings.stun_server = stun_server;
             }
             "is-live" => {
                 let mut settings = self.settings.lock().unwrap();
                 let is_live = value.get::<bool>().expect("type checked upstream");
-                gst::info!(
-                    CAT,
-                    "Changing is-live from {} to {}",
-                    settings.is_live,
-                    is_live
-                );
+                gst::info!( CAT, "Changing is-live from {} to {}", settings.is_live, is_live);
                 settings.is_live = is_live;
             }
             _ => unimplemented!(),
@@ -268,10 +251,7 @@ impl BaseSinkImpl for WebSink {
         let runtime = match Runtime::new() {
             Ok(rt) => rt,
             Err(err) => {
-                return Err(gst::error_msg!(
-                    gst::ResourceError::Failed,
-                    ["Failed to create Tokio runtime: {}", err]
-                ));
+                return Err(gst::error_msg!(gst::ResourceError::Failed, ["Failed to create Tokio runtime: {}", err]));
             }
         };
 
@@ -285,64 +265,8 @@ impl BaseSinkImpl for WebSink {
 
         // let settings = self.settings.lock().unwrap().clone();
         let rt = state.runtime.as_ref().expect("Runtime should be initialized");
-
         let port = self.settings.lock().unwrap().port; // Use the initially configured port for this log
-
-        // let server_handle = self.start_http_server(port, rt).map_err(|e| {
-        //     gst::error_msg!(gst::ResourceError::Failed, ["Failed to start HTTP server: {}", e])
-        // })?;
-
-        let server_handle = rt.spawn(async move {
-
-            // API session placeholder
-            let api_session = warp::path!("api" / "session")
-                .and(warp::post())
-                .and(warp::body::json())
-                .map(|_body: SessionRequest| {
-                    // For now, just acknowledge. Later, this will handle WebRTC setup.
-                    let response = SessionResponse {
-                        answer: serde_json::json!({"type": "answer", "sdp": "dummy"}),
-                        session_id: "dummy_session_id".to_string(),
-                    };
-                    warp::reply::json(&response)
-                });
-
-            let static_assets = warp::path::tail().and_then(|tail: warp::path::Tail| async move {
-                let path = tail.as_str();
-                let path_to_serve = if path.is_empty() || path == "/" {
-                    "index.html"
-                } else {
-                    path
-                };
-
-                match Asset::get(path_to_serve) {
-                    Some(content) => {
-                        let mime = mime_guess::from_path(path_to_serve).first_or_octet_stream();
-                        let body: Cow<'static, [u8]> = content.data;
-                        let response = warp::http::Response::builder()
-                            .header("Content-Type", mime.as_ref())
-                            .body(body)
-                            .map_err(|e| {
-                                gst::error!(CAT, "Failed to build response: {}", e);
-                                warp::reject::custom(ServeError)
-                            })?;
-                        Ok(response)
-                    }
-                    None => {
-                        gst::debug!(CAT, "Static asset not found: {}", path_to_serve);
-                        Err(warp::reject::not_found())
-                    }
-                }
-            });
-
-            let routes = api_session.or(static_assets);
-
-            gst::info!(CAT, "HTTP server attempting to start on http://0.0.0.0:{}", port);
-            println!("{}HTTP server configured for http://localhost:{}{}", GREEN, port, RESET);
-
-            warp::serve(routes).run(([0, 0, 0, 0], port)).await;
-            gst::info!(CAT, "HTTP server on port {} stopped.", port);
-        });
+        let server_handle = self.start_http_server(port, rt);
 
         // Store the server handle in the state
         let mut locked_state = self.state.lock().unwrap(); // Re-lock to modify state
@@ -417,9 +341,10 @@ impl BaseSinkImpl for WebSink {
 }
 
 impl WebSink {
-    fn start_http_server(&self, port:u16, rt:&Runtime) -> Result<tokio::task::JoinHandle<()>, gst::ErrorMessage> {
+    fn start_http_server(&self, port:u16, rt:&Runtime) -> tokio::task::JoinHandle<()> {
         // let settings = self.settings.lock().unwrap().clone();
-        let state = self.state.lock().unwrap();
+        println!("{}TEST2{}{}", GREEN, port, RESET);
+        // let state = self.state.lock().unwrap();
 
         let server_handle = rt.spawn(async move {
             // API session placeholder
@@ -471,7 +396,7 @@ impl WebSink {
             warp::serve(routes).run(([0, 0, 0, 0], port)).await;
             gst::info!(CAT, "HTTP server on port {} stopped.", port);
         });
-        Ok(server_handle)
+        server_handle
     }
 }
 
