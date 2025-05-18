@@ -17,6 +17,10 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
+use warp::Filter;
+use rust_embed::RustEmbed;
+use std::borrow::Cow;
+
 // Color codes for terminal output
 const GREEN: &str = "\x1b[32m";
 const RESET: &str = "\x1b[0m";
@@ -63,6 +67,10 @@ impl Default for Settings {
         }
     }
 }
+
+#[derive(RustEmbed)]
+#[folder = "rswebsink/static/"] // Path relative to the Cargo.toml of the rswebsink crate
+struct Asset;
 
 // Structure to hold peer connection
 struct PeerConnection {
@@ -275,13 +283,71 @@ impl BaseSinkImpl for WebSink {
         state.unblock_tx = Some(tx);
         state.unblock_rx = Some(rx);
 
-        // TODO: Start HTTP server and WebRTC setup
-        // This will be implemented later using webrtc-rs
-        // For now, we just report success
+        // let settings = self.settings.lock().unwrap().clone();
+        let rt = state.runtime.as_ref().expect("Runtime should be initialized");
 
-        let port = self.settings.lock().unwrap().port;
-        gst::info!(CAT, "WebSink started on port {}", port);
-        println!("{}HTTP server would start at http://localhost:{}{}", GREEN, port, RESET);
+        let port = self.settings.lock().unwrap().port; // Use the initially configured port for this log
+
+        // let server_handle = self.start_http_server(port, rt).map_err(|e| {
+        //     gst::error_msg!(gst::ResourceError::Failed, ["Failed to start HTTP server: {}", e])
+        // })?;
+
+        let server_handle = rt.spawn(async move {
+
+            // API session placeholder
+            let api_session = warp::path!("api" / "session")
+                .and(warp::post())
+                .and(warp::body::json())
+                .map(|_body: SessionRequest| {
+                    // For now, just acknowledge. Later, this will handle WebRTC setup.
+                    let response = SessionResponse {
+                        answer: serde_json::json!({"type": "answer", "sdp": "dummy"}),
+                        session_id: "dummy_session_id".to_string(),
+                    };
+                    warp::reply::json(&response)
+                });
+
+            let static_assets = warp::path::tail().and_then(|tail: warp::path::Tail| async move {
+                let path = tail.as_str();
+                let path_to_serve = if path.is_empty() || path == "/" {
+                    "index.html"
+                } else {
+                    path
+                };
+
+                match Asset::get(path_to_serve) {
+                    Some(content) => {
+                        let mime = mime_guess::from_path(path_to_serve).first_or_octet_stream();
+                        let body: Cow<'static, [u8]> = content.data;
+                        let response = warp::http::Response::builder()
+                            .header("Content-Type", mime.as_ref())
+                            .body(body)
+                            .map_err(|e| {
+                                gst::error!(CAT, "Failed to build response: {}", e);
+                                warp::reject::custom(ServeError)
+                            })?;
+                        Ok(response)
+                    }
+                    None => {
+                        gst::debug!(CAT, "Static asset not found: {}", path_to_serve);
+                        Err(warp::reject::not_found())
+                    }
+                }
+            });
+
+            let routes = api_session.or(static_assets);
+
+            gst::info!(CAT, "HTTP server attempting to start on http://0.0.0.0:{}", port);
+            println!("{}HTTP server configured for http://localhost:{}{}", GREEN, port, RESET);
+
+            warp::serve(routes).run(([0, 0, 0, 0], port)).await;
+            gst::info!(CAT, "HTTP server on port {} stopped.", port);
+        });
+
+        // Store the server handle in the state
+        let mut locked_state = self.state.lock().unwrap(); // Re-lock to modify state
+        locked_state.server_handle = Some(server_handle);
+
         Ok(())
     }
 
@@ -291,13 +357,13 @@ impl BaseSinkImpl for WebSink {
         // Clean up resources
         let mut state = self.state.lock().unwrap();
 
-        // Stop the HTTP server (if we had one)
+        // Stop the HTTP server
         if let Some(handle) = state.server_handle.take() {
-            if let Some(rt) = &state.runtime {
-                rt.block_on(async {
-                    handle.abort();
-                });
-            }
+            gst::info!(CAT, "Aborting HTTP server task...");
+            handle.abort();
+            // Optionally, could await the handle here if running in a context that allows it,
+            // but abort is generally sufficient for cleanup.
+            gst::info!(CAT, "HTTP server task aborted.");
         }
 
         // Clear peer connections
@@ -318,10 +384,10 @@ impl BaseSinkImpl for WebSink {
     fn render(&self, buffer: &gst::Buffer) -> Result<gst::FlowSuccess, gst::FlowError> {
         // Get the number of connected peers
         let num_peers = self.num_peers.load(Ordering::SeqCst);
-        let settings = self.settings.lock().unwrap();
+        let settings_guard = self.settings.lock().unwrap(); // Keep the guard
 
         // In live mode, we skip rendering if no peers are connected
-        if settings.is_live && num_peers == 0 {
+        if settings_guard.is_live && num_peers == 0 {
             gst::trace!(CAT, "No peers connected, skipping buffer");
             return Ok(gst::FlowSuccess::Ok);
         }
@@ -349,3 +415,66 @@ impl BaseSinkImpl for WebSink {
         Ok(())
     }
 }
+
+impl WebSink {
+    fn start_http_server(&self, port:u16, rt:&Runtime) -> Result<tokio::task::JoinHandle<()>, gst::ErrorMessage> {
+        // let settings = self.settings.lock().unwrap().clone();
+        let state = self.state.lock().unwrap();
+
+        let server_handle = rt.spawn(async move {
+            // API session placeholder
+            let api_session = warp::path!("api" / "session")
+                .and(warp::post())
+                .and(warp::body::json())
+                .map(|_body: SessionRequest| {
+                    // For now, just acknowledge. Later, this will handle WebRTC setup.
+                    let response = SessionResponse {
+                        answer: serde_json::json!({"type": "answer", "sdp": "dummy"}),
+                        session_id: "dummy_session_id".to_string(),
+                    };
+                    warp::reply::json(&response)
+                });
+
+            let static_assets = warp::path::tail().and_then(|tail: warp::path::Tail| async move {
+                let path = tail.as_str();
+                let path_to_serve = if path.is_empty() || path == "/" {
+                    "index.html"
+                } else {
+                    path
+                };
+
+                match Asset::get(path_to_serve) {
+                    Some(content) => {
+                        let mime = mime_guess::from_path(path_to_serve).first_or_octet_stream();
+                        let body: Cow<'static, [u8]> = content.data;
+                        let response = warp::http::Response::builder()
+                            .header("Content-Type", mime.as_ref())
+                            .body(body)
+                            .map_err(|e| {
+                                gst::error!(CAT, "Failed to build response: {}", e);
+                                warp::reject::custom(ServeError)
+                            })?;
+                        Ok(response)
+                    }
+                    None => {
+                        gst::debug!(CAT, "Static asset not found: {}", path_to_serve);
+                        Err(warp::reject::not_found())
+                    }
+                }
+            });
+
+            let routes = api_session.or(static_assets);
+
+            gst::info!(CAT, "HTTP server attempting to start on http://0.0.0.0:{}", port);
+            println!("{}HTTP server configured for http://localhost:{}{}", GREEN, port, RESET);
+
+            warp::serve(routes).run(([0, 0, 0, 0], port)).await;
+            gst::info!(CAT, "HTTP server on port {} stopped.", port);
+        });
+        Ok(server_handle)
+    }
+}
+
+#[derive(Debug)]
+struct ServeError;
+impl warp::reject::Reject for ServeError {}
