@@ -546,7 +546,7 @@ func (w *WebSink) Render(self *base.GstBaseSink, buffer *gst.Buffer) gst.FlowRet
 
 	if w.settings.isLive {
 		if w.state.numPeers.Load() == 0 {
-			self.Log(CAT, gst.LevelInfo, "No clients connected")
+			self.Log(CAT, gst.LevelDebug, "No clients connected")
 			return gst.FlowOK
 		}
 	} else {

@@ -49,3 +49,4 @@ test/*.png
 zzgenerated*
 *.h
 gstshark*
+target/
