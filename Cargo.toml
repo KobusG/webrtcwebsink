@@ -12,6 +12,10 @@ name = "gstwebsink"
 crate-type = ["cdylib"]
 path = "rswebsink/lib.rs"
 
+[[bin]]
+name = "test-rswebsink"
+path = "rswebsink/main.rs"
+
 [dependencies]
 gst = { package = "gstreamer", version = "0.23.6" }
 gst-base = { package = "gstreamer-base", version = "0.23.6" }
@@ -32,6 +36,9 @@ bytes = "1.10.1"
 warp = "0.3"
 rust-embed = "8.0"
 mime_guess = "2.0.5"
+ctrlc = "3.4.4"
+clap = { version = "4.5.38", features = ["derive"] }
+failure = "0.1.8"
 
 [build-dependencies]
 gst-plugin-version-helper = "0.8.2"
