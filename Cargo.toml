@@ -9,7 +9,7 @@ repository = "https://github.com/videologyinc/websink"
 
 [lib]
 name = "gstwebsink"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"] # Ensure rlib is also produced for tests
 path = "rswebsink/lib.rs"
 
 [[bin]]

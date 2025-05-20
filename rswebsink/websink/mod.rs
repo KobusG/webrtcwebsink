@@ -2,7 +2,7 @@ use gst::glib;
 use gst::prelude::*;
 
 // Module that contains the element implementation
-mod imp;
+pub mod imp; // Make the imp module public
 
 // The WebSink element wrapped in a Rust safe interface
 glib::wrapper! {
