@@ -2,24 +2,32 @@ use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_base::subclass::prelude::*;
-// use gst_video::prelude::*;
-// use gst_video::subclass::prelude::*;
 
-use std::sync::Mutex;
-
+use std::sync::{Arc, Mutex};
 use std::sync::LazyLock;
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Duration;
 
-// use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use warp::Filter;
 use rust_embed::RustEmbed;
 use std::borrow::Cow;
+
+// WebRTC imports
+use webrtc::api::interceptor_registry::register_default_interceptors;
+use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264};
+use webrtc::api::APIBuilder;
+use webrtc::ice_transport::ice_server::RTCIceServer;
+use webrtc::interceptor::registry::Registry;
+use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+use webrtc::media::Sample;
 
 // Color codes for terminal output
 const GREEN: &str = "\x1b[32m";
@@ -73,31 +81,36 @@ impl Default for Settings {
 #[folder = "rswebsink/static/"] // Path relative to the Cargo.toml of the rswebsink crate
 struct Asset;
 
-// Structure to hold peer connection
+// Structure to hold peer connection with actual WebRTC connection
 struct PeerConnection {
     peer_id: String,
-    // We'll implement WebRTC connection using webrtc-rs later
+    connection: Arc<webrtc::peer_connection::RTCPeerConnection>,
 }
 
 // Element state containing HTTP server and WebRTC components
 struct State {
-    // actual_port: u16,
     runtime: Option<Runtime>,
     server_handle: Option<tokio::task::JoinHandle<()>>,
     peer_connections: HashMap<String, PeerConnection>,
     unblock_tx: Option<mpsc::Sender<i32>>,
     unblock_rx: Option<mpsc::Receiver<i32>>,
+    // WebRTC components
+    webrtc_api: Option<webrtc::api::API>,
+    video_track: Option<Arc<TrackLocalStaticSample>>,
+    webrtc_config: Option<RTCConfiguration>,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
-            // actual_port: 0,
             runtime: None,
             server_handle: None,
             peer_connections: HashMap::new(),
             unblock_tx: None,
             unblock_rx: None,
+            webrtc_api: None,
+            video_track: None,
+            webrtc_config: None,
         }
     }
 }
@@ -245,95 +258,209 @@ impl ElementImpl for WebSink {
 // Implementation of BaseSink methods
 impl BaseSinkImpl for WebSink {
     fn start(&self) -> Result<(), gst::ErrorMessage> {
-        gst::info!(CAT, "Starting WebSink");
+        gst::info!(CAT, "🚀 Starting WebSink");
 
         // Initialize Tokio runtime
+        gst::debug!(CAT, "⚙️ Initializing Tokio runtime");
         let runtime = match Runtime::new() {
-            Ok(rt) => rt,
+            Ok(rt) => {
+                gst::info!(CAT, "✅ Tokio runtime created successfully");
+                rt
+            },
             Err(err) => {
+                gst::error!(CAT, "❌ Failed to create Tokio runtime: {}", err);
                 return Err(gst::error_msg!(gst::ResourceError::Failed, ["Failed to create Tokio runtime: {}", err]));
             }
         };
 
         // Setup an unblock channel for live mode
         let (tx, rx) = mpsc::channel(1);
+        gst::info!(CAT, "📺 Created mpsc channel for live mode signaling");
+
+        // Initialize WebRTC API
+        gst::debug!(CAT, "🌐 Initializing WebRTC API");
+        let webrtc_api = runtime.block_on(async {
+            let mut m = MediaEngine::default();
+            m.register_default_codecs()?;
+
+            let mut registry = Registry::new();
+            registry = register_default_interceptors(registry, &mut m)?;
+
+            let api = APIBuilder::new()
+                .with_media_engine(m)
+                .with_interceptor_registry(registry)
+                .build();
+
+            Ok::<webrtc::api::API, webrtc::Error>(api)
+        }).map_err(|err| {
+            gst::error!(CAT, "❌ Failed to create WebRTC API: {}", err);
+            gst::error_msg!(gst::ResourceError::Failed, ["Failed to create WebRTC API: {}", err])
+        })?;
+        gst::info!(CAT, "✅ WebRTC API initialized successfully");
+
+        // Create video track
+        gst::debug!(CAT, "🎥 Creating video track for H.264");
+        let video_track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_H264.to_owned(),
+                ..Default::default()
+            },
+            "video".to_owned(),
+            "websink".to_owned(),
+        ));
+        gst::info!(CAT, "✅ Video track created successfully");
+
+        // Configure WebRTC
+        let settings = self.settings.lock().unwrap();
+        let mut webrtc_config = RTCConfiguration::default();
+        if !settings.stun_server.is_empty() {
+            webrtc_config.ice_servers = vec![RTCIceServer {
+                urls: vec![settings.stun_server.clone()],
+                ..Default::default()
+            }];
+            gst::info!(CAT, "🌐 STUN server configured: {}", settings.stun_server);
+        } else {
+            gst::info!(CAT, "⚠️ No STUN server configured");
+        }
+        let port = settings.port;
+        drop(settings);
 
         let mut state = self.state.lock().unwrap();
         state.runtime = Some(runtime);
         state.unblock_tx = Some(tx);
         state.unblock_rx = Some(rx);
+        state.webrtc_api = Some(webrtc_api);
+        state.video_track = Some(video_track);
+        state.webrtc_config = Some(webrtc_config);
 
-        // let settings = self.settings.lock().unwrap().clone();
+        // Start HTTP server
+        gst::info!(CAT, "🌐 Starting HTTP server on port {}", port);
         let rt = state.runtime.as_ref().expect("Runtime should be initialized");
-        let port = self.settings.lock().unwrap().port; // Use the initially configured port for this log
         let server_handle = self.start_http_server(port, rt);
 
-        // Store the server handle in the state
-        let mut locked_state = self.state.lock().unwrap(); // Re-lock to modify state
-        locked_state.server_handle = Some(server_handle);
+        state.server_handle = Some(server_handle);
+        gst::info!(CAT, "✅ WebSink started successfully");
 
         Ok(())
     }
 
     fn stop(&self) -> Result<(), gst::ErrorMessage> {
-        gst::info!(CAT, "Stopping WebSink");
+        gst::info!(CAT, "🛑 Stopping WebSink");
 
         // Clean up resources
         let mut state = self.state.lock().unwrap();
 
         // Stop the HTTP server
         if let Some(handle) = state.server_handle.take() {
-            gst::info!(CAT, "Aborting HTTP server task...");
+            gst::info!(CAT, "🌐 Aborting HTTP server task...");
             handle.abort();
             // Optionally, could await the handle here if running in a context that allows it,
             // but abort is generally sufficient for cleanup.
-            gst::info!(CAT, "HTTP server task aborted.");
+            gst::info!(CAT, "✅ HTTP server task aborted.");
+        } else {
+            gst::debug!(CAT, "🌐 No HTTP server handle to abort");
         }
 
         // Clear peer connections
+        let peer_count = state.peer_connections.len();
         state.peer_connections.clear();
+        gst::info!(CAT, "👥 Cleared {} peer connections", peer_count);
 
         // Reset state
         state.unblock_tx = None;
         state.unblock_rx = None;
         state.runtime = None;
+        state.webrtc_api = None;
+        state.video_track = None;
+        state.webrtc_config = None;
+        gst::debug!(CAT, "🧹 Reset all state components");
 
         // Reset peer count
         self.num_peers.store(0, Ordering::SeqCst);
+        gst::debug!(CAT, "🔢 Reset peer count to 0");
 
-        gst::info!(CAT, "WebSink stopped");
+        gst::info!(CAT, "✅ WebSink stopped successfully");
         Ok(())
     }
 
     fn render(&self, buffer: &gst::Buffer) -> Result<gst::FlowSuccess, gst::FlowError> {
         // Get the number of connected peers
         let num_peers = self.num_peers.load(Ordering::SeqCst);
-        let settings_guard = self.settings.lock().unwrap(); // Keep the guard
+        let settings_guard = self.settings.lock().unwrap();
+
+        gst::trace!(CAT, "🎬 Render called - buffer size: {} bytes, peers: {}", 
+                   buffer.size(), num_peers);
 
         // In live mode, we skip rendering if no peers are connected
         if settings_guard.is_live && num_peers == 0 {
-            gst::trace!(CAT, "No peers connected, skipping buffer");
+            gst::trace!(CAT, "⏭️ No peers connected in live mode, skipping buffer");
             return Ok(gst::FlowSuccess::Ok);
         }
+        drop(settings_guard);
 
-        // For now, we'll just log the buffer information
-        gst::trace!(CAT, "Rendered buffer {:?}", buffer);
+        // Map the buffer to get the data
+        let map = buffer.map_readable().map_err(|_| {
+            gst::error!(CAT, "❌ Failed to map buffer");
+            gst::FlowError::Error
+        })?;
 
-        // In a real implementation, we would:
-        // 1. Map the buffer data
-        // 2. Send it to all WebRTC peers
-        // This will be implemented later using webrtc-rs
+        let data = map.as_slice();
 
+        // Send to video track if we have peers
+        if num_peers > 0 {
+            gst::debug!(CAT, "📹 Sending {} bytes to {} peers", data.len(), num_peers);
+            
+            let state = self.state.lock().unwrap();
+            if let Some(video_track) = &state.video_track {
+                let track_clone = Arc::clone(video_track);
+                let data_copy = bytes::Bytes::copy_from_slice(data);
+                let duration = buffer.duration().unwrap_or_else(|| gst::ClockTime::from_nseconds(33_333_333)); // Default 30fps
+
+                gst::trace!(CAT, "⏱️ Buffer duration: {} ns", duration.nseconds());
+
+                // Use the runtime to send the sample
+                if let Some(runtime) = &state.runtime {
+                    runtime.spawn(async move {
+                        let sample = Sample {
+                            data: data_copy,
+                            duration: Duration::from_nanos(duration.nseconds()),
+                            ..Default::default()
+                        };
+
+                        gst::trace!(CAT, "🚀 Spawned async task to write sample to WebRTC track");
+                        
+                        if let Err(e) = track_clone.write_sample(&sample).await {
+                            gst::error!(CAT, "❌ Failed to write sample to WebRTC track: {}", e);
+                        } else {
+                            gst::trace!(CAT, "✅ Successfully wrote sample to WebRTC track");
+                        }
+                    });
+                } else {
+                    gst::error!(CAT, "❌ No Tokio runtime available for async sample writing");
+                }
+            } else {
+                gst::warning!(CAT, "⚠️ No video track available for sample writing");
+            }
+        } else {
+            gst::trace!(CAT, "👥 No peers connected, not sending video data");
+        }
+
+        gst::trace!(CAT, "✅ Rendered buffer with {} bytes to {} peers", data.len(), num_peers);
         Ok(gst::FlowSuccess::Ok)
     }
 
     fn unlock(&self) -> Result<(), gst::ErrorMessage> {
-        gst::debug!(CAT, "Unlocking");
+        gst::debug!(CAT, "🔓 Unlocking");
 
         // Signal to unblock the render method
         let state = self.state.lock().unwrap();
         if let Some(tx) = &state.unblock_tx {
-            let _ = tx.try_send(-1);
+            match tx.try_send(-1) {
+                Ok(_) => gst::debug!(CAT, "📤 Sent unlock signal via mpsc channel"),
+                Err(e) => gst::warning!(CAT, "⚠️ Failed to send unlock signal: {:?}", e),
+            }
+        } else {
+            gst::warning!(CAT, "⚠️ No mpsc sender available for unlock signal");
         }
 
         Ok(())
@@ -341,23 +468,30 @@ impl BaseSinkImpl for WebSink {
 }
 
 impl WebSink {
-    fn start_http_server(&self, port:u16, rt:&Runtime) -> tokio::task::JoinHandle<()> {
-        // let settings = self.settings.lock().unwrap().clone();
-        println!("{}TEST2{}{}", GREEN, port, RESET);
-        // let state = self.state.lock().unwrap();
+    fn start_http_server(&self, port: u16, rt: &Runtime) -> tokio::task::JoinHandle<()> {
+        gst::info!(CAT, "Starting HTTP server on port {}", port);
 
-        let server_handle = rt.spawn(async move {
-            // API session placeholder
+        rt.spawn(async move {
+            // API session handler - simplified for now, WebRTC will be handled differently
             let api_session = warp::path!("api" / "session")
                 .and(warp::post())
                 .and(warp::body::json())
-                .map(|_body: SessionRequest| {
-                    // For now, just acknowledge. Later, this will handle WebRTC setup.
+                .and_then(|body: SessionRequest| async move {
+                    gst::info!(CAT, "🔗 Received WebRTC session request");
+                    gst::debug!(CAT, "📨 Session request body: {:?}", body);
+                    
+                    // For now, return a dummy response
+                    // TODO: Implement proper WebRTC signaling
+                    let session_id = Uuid::new_v4().to_string();
                     let response = SessionResponse {
                         answer: serde_json::json!({"type": "answer", "sdp": "dummy"}),
-                        session_id: "dummy_session_id".to_string(),
+                        session_id: session_id.clone(),
                     };
-                    warp::reply::json(&response)
+                    
+                    gst::info!(CAT, "✅ Sending WebRTC session response for session: {}", session_id);
+                    gst::debug!(CAT, "📤 Session response: {:?}", response);
+                    
+                    Ok::<_, warp::Rejection>(warp::reply::json(&response))
                 });
 
             let static_assets = warp::path::tail().and_then(|tail: warp::path::Tail| async move {
@@ -368,21 +502,22 @@ impl WebSink {
                     path
                 };
 
+                gst::debug!(CAT, "🌐 Static asset request for: {}", path_to_serve);
+
                 match Asset::get(path_to_serve) {
                     Some(content) => {
                         let mime = mime_guess::from_path(path_to_serve).first_or_octet_stream();
                         let body: Cow<'static, [u8]> = content.data;
+                        gst::debug!(CAT, "✅ Serving static asset: {} ({} bytes, mime: {})", 
+                                   path_to_serve, body.len(), mime.as_ref());
                         let response = warp::http::Response::builder()
                             .header("Content-Type", mime.as_ref())
                             .body(body)
-                            .map_err(|e| {
-                                gst::error!(CAT, "Failed to build response: {}", e);
-                                warp::reject::custom(ServeError)
-                            })?;
+                            .map_err(|_| warp::reject::custom(ServeError))?;
                         Ok(response)
                     }
                     None => {
-                        gst::debug!(CAT, "Static asset not found: {}", path_to_serve);
+                        gst::warning!(CAT, "❌ Static asset not found: {}", path_to_serve);
                         Err(warp::reject::not_found())
                     }
                 }
@@ -390,16 +525,50 @@ impl WebSink {
 
             let routes = api_session.or(static_assets);
 
-            gst::info!(CAT, "HTTP server attempting to start on http://0.0.0.0:{}", port);
-            println!("{}HTTP server configured for http://localhost:{}{}", GREEN, port, RESET);
+            gst::info!(CAT, "HTTP server starting on http://0.0.0.0:{}", port);
+            println!("{}HTTP server starting on http://localhost:{}{}", GREEN, port, RESET);
 
             warp::serve(routes).run(([0, 0, 0, 0], port)).await;
             gst::info!(CAT, "HTTP server on port {} stopped.", port);
-        });
-        server_handle
+        })
+    }
+
+    fn update_peer_connections(&self, peer_id: String, pc: Option<Arc<webrtc::peer_connection::RTCPeerConnection>>, add: bool) {
+        gst::debug!(CAT, "🔄 Updating peer connections - peer: {}, add: {}", peer_id, add);
+        
+        let mut state = self.state.lock().unwrap();
+        
+        if add {
+            if let Some(connection) = pc {
+                state.peer_connections.insert(peer_id.clone(), PeerConnection {
+                    peer_id: peer_id.clone(),
+                    connection,
+                });
+                gst::info!(CAT, "➕ Added peer connection: {}", peer_id);
+            }
+        } else {
+            if let Some(_) = state.peer_connections.remove(&peer_id) {
+                gst::info!(CAT, "➖ Removed peer connection: {}", peer_id);
+            } else {
+                gst::warning!(CAT, "⚠️ Tried to remove non-existent peer: {}", peer_id);
+            }
+        }
+        
+        let count = state.peer_connections.len() as i32;
+        self.num_peers.store(count, Ordering::SeqCst);
+        gst::info!(CAT, "👥 Client count changed: {} connected clients", count);
+        
+        // Send notification on peer change channel (non-blocking)
+        if let Some(tx) = &state.unblock_tx {
+            match tx.try_send(count) {
+                Ok(_) => gst::debug!(CAT, "📤 Sent peer count update ({}) via mpsc channel", count),
+                Err(e) => gst::warning!(CAT, "⚠️ Failed to send peer count update: {:?}", e),
+            }
+        } else {
+            gst::warning!(CAT, "⚠️ No mpsc sender available for peer count update");
+        }
     }
 }
-
 #[derive(Debug)]
 struct ServeError;
 impl warp::reject::Reject for ServeError {}
