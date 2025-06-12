@@ -27,14 +27,11 @@ fn main() {
     // Initialize GStreamer
     gst::init().expect("Failed to initialize gst_init");
 
-    /* Disable stdout debug, then configure the debug ringbuffer and enable
-     * all debug */
-    gst::log::remove_default_log_function();
-    /* Keep 1KB of logs per thread, removing old threads after 10 seconds */
-    gst::log::add_ring_buffer_logger(1024, 10);
-    /* Enable all debug categories */
+    /* Enable stdout debug for websink category */
     gst::log::set_default_threshold(gst::DebugLevel::Warning);
     gst::log::set_threshold_for_name("websink", gst::DebugLevel::Debug);
+
+    println!("🚀 Starting Rust WebSink test application");
 
     // Register the WebSink element with GStreamer
     gst::Element::register(None, "websink", gst::Rank::NONE, websink::WebSink::static_type()).unwrap();
@@ -46,7 +43,7 @@ fn main() {
 
 fn start(main_loop: &glib::MainLoop) -> Result<(), Error> {
 
-    let pls = "videotestsrc ! video/x-raw,width=1280,height=640 ! videoconvert ! avenc_h264_omx ! websink name=wsink";
+    let pls = "videotestsrc is-live=true ! video/x-raw,width=640,height=480,framerate=30/1 ! videoconvert ! x264enc tune=zerolatency ! websink name=wsink";
     let pipeline = gst::parse::launch(&pls).unwrap();
     let pipeline = pipeline.downcast::<gst::Pipeline>().unwrap();
 
