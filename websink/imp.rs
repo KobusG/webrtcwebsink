@@ -86,7 +86,7 @@ struct Asset;
 
 // Custom error for session handling
 #[derive(Debug)]
-struct SessionError(String);
+struct SessionError();
 impl warp::reject::Reject for SessionError {}
 
 // Handle WebRTC session request (create peer connection and answer)
@@ -579,7 +579,7 @@ impl WebSink {
                         },
                         Err(e) => {
                             gst::error!(CAT, "❌ Failed to handle WebRTC session request: {}", e);
-                            Err(warp::reject::custom(SessionError(e.to_string())))
+                            Err(warp::reject::custom(SessionError()))
                         }
                     }
                 });

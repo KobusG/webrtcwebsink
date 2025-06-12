@@ -10,6 +10,7 @@ glib::wrapper! {
 }
 
 // Register the WebSink element with GStreamer
+#[allow(dead_code)]
 pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     gst::Element::register(
         Some(plugin),
