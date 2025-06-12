@@ -25,8 +25,10 @@ use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+use webrtc::track::track_local::TrackLocal;
 use webrtc::media::Sample;
 
 // Color codes for terminal output
@@ -81,17 +83,101 @@ impl Default for Settings {
 #[folder = "rswebsink/static/"] // Path relative to the Cargo.toml of the rswebsink crate
 struct Asset;
 
-// Structure to hold peer connection with actual WebRTC connection
-struct PeerConnection {
-    peer_id: String,
-    connection: Arc<webrtc::peer_connection::RTCPeerConnection>,
+// Custom error for session handling
+#[derive(Debug)]
+struct SessionError(String);
+impl warp::reject::Reject for SessionError {}
+
+// Handle WebRTC session request (create peer connection and answer)
+async fn handle_session_request(req: SessionRequest) -> Result<SessionResponse, Box<dyn std::error::Error + Send + Sync>> {
+    gst::info!(CAT, "🎯 Processing WebRTC session request");
+
+    // Create a MediaEngine and API
+    let mut m = MediaEngine::default();
+    m.register_default_codecs()?;
+
+    let mut registry = Registry::new();
+    registry = register_default_interceptors(registry, &mut m)?;
+
+    let api = APIBuilder::new()
+        .with_media_engine(m)
+        .with_interceptor_registry(registry)
+        .build();
+
+    // Configure WebRTC with STUN server
+    let config = RTCConfiguration {
+        ice_servers: vec![RTCIceServer {
+            urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    // Create a new peer connection
+    let peer_connection = Arc::new(api.new_peer_connection(config).await?);
+    gst::info!(CAT, "📞 Created new peer connection");
+
+    // Create and add video track
+    let video_track = Arc::new(TrackLocalStaticSample::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_H264.to_owned(),
+            ..Default::default()
+        },
+        "video".to_owned(),
+        "websink".to_owned(),
+    ));
+
+    // Add the track to the peer connection
+    let _rtp_sender = peer_connection
+        .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal + Send + Sync>)
+        .await?;
+    gst::info!(CAT, "🎥 Added video track to peer connection");
+
+    // Parse the offer from the request
+    let offer: RTCSessionDescription = serde_json::from_value(req.offer)?;
+    gst::info!(CAT, "📨 Parsed offer from client");
+
+    // Set remote description
+    peer_connection.set_remote_description(offer).await?;
+    gst::info!(CAT, "🔗 Set remote description");
+
+    // Create answer
+    let answer = peer_connection.create_answer(None).await?;
+    gst::info!(CAT, "📤 Created answer");
+
+    // Set local description
+    peer_connection.set_local_description(answer).await?;
+    gst::info!(CAT, "🏠 Set local description");
+
+    // Wait for ICE gathering to complete
+    let mut gather_complete = peer_connection.gathering_complete_promise().await;
+    let _ = gather_complete.recv().await;
+    gst::info!(CAT, "🧊 ICE gathering completed");
+
+    // Get the final answer with ICE candidates
+    let final_answer = peer_connection.local_description().await
+        .ok_or("Failed to get local description")?;
+
+    // Generate session ID
+    let session_id = Uuid::new_v4().to_string();
+
+    // Serialize answer to JSON
+    let answer_json = serde_json::to_value(&final_answer)?;
+
+    let response = SessionResponse {
+        answer: answer_json,
+        session_id: session_id.clone(),
+    };
+
+    gst::info!(CAT, "✅ WebRTC session established with ID: {}", session_id);
+    Ok(response)
 }
 
 // Element state containing HTTP server and WebRTC components
 struct State {
     runtime: Option<Runtime>,
     server_handle: Option<tokio::task::JoinHandle<()>>,
-    peer_connections: HashMap<String, PeerConnection>,
+    peer_connections: HashMap<String, Arc<webrtc::peer_connection::RTCPeerConnection>>,
     unblock_tx: Option<mpsc::Sender<i32>>,
     unblock_rx: Option<mpsc::Receiver<i32>>,
     // WebRTC components
@@ -388,7 +474,7 @@ impl BaseSinkImpl for WebSink {
         let num_peers = self.num_peers.load(Ordering::SeqCst);
         let settings_guard = self.settings.lock().unwrap();
 
-        gst::trace!(CAT, "🎬 Render called - buffer size: {} bytes, peers: {}", 
+        gst::trace!(CAT, "🎬 Render called - buffer size: {} bytes, peers: {}",
                    buffer.size(), num_peers);
 
         // In live mode, we skip rendering if no peers are connected
@@ -409,7 +495,7 @@ impl BaseSinkImpl for WebSink {
         // Send to video track if we have peers
         if num_peers > 0 {
             gst::debug!(CAT, "📹 Sending {} bytes to {} peers", data.len(), num_peers);
-            
+
             let state = self.state.lock().unwrap();
             if let Some(video_track) = &state.video_track {
                 let track_clone = Arc::clone(video_track);
@@ -428,7 +514,7 @@ impl BaseSinkImpl for WebSink {
                         };
 
                         gst::trace!(CAT, "🚀 Spawned async task to write sample to WebRTC track");
-                        
+
                         if let Err(e) = track_clone.write_sample(&sample).await {
                             gst::error!(CAT, "❌ Failed to write sample to WebRTC track: {}", e);
                         } else {
@@ -472,26 +558,24 @@ impl WebSink {
         gst::info!(CAT, "Starting HTTP server on port {}", port);
 
         rt.spawn(async move {
-            // API session handler - simplified for now, WebRTC will be handled differently
+            // API session handler - now with actual WebRTC signaling
             let api_session = warp::path!("api" / "session")
                 .and(warp::post())
                 .and(warp::body::json())
                 .and_then(|body: SessionRequest| async move {
                     gst::info!(CAT, "🔗 Received WebRTC session request");
                     gst::debug!(CAT, "📨 Session request body: {:?}", body);
-                    
-                    // For now, return a dummy response
-                    // TODO: Implement proper WebRTC signaling
-                    let session_id = Uuid::new_v4().to_string();
-                    let response = SessionResponse {
-                        answer: serde_json::json!({"type": "answer", "sdp": "dummy"}),
-                        session_id: session_id.clone(),
-                    };
-                    
-                    gst::info!(CAT, "✅ Sending WebRTC session response for session: {}", session_id);
-                    gst::debug!(CAT, "📤 Session response: {:?}", response);
-                    
-                    Ok::<_, warp::Rejection>(warp::reply::json(&response))
+
+                    match handle_session_request(body).await {
+                        Ok(response) => {
+                            gst::info!(CAT, "✅ Successfully handled WebRTC session request");
+                            Ok(warp::reply::json(&response))
+                        },
+                        Err(e) => {
+                            gst::error!(CAT, "❌ Failed to handle WebRTC session request: {}", e);
+                            Err(warp::reject::custom(SessionError(e.to_string())))
+                        }
+                    }
                 });
 
             let static_assets = warp::path::tail().and_then(|tail: warp::path::Tail| async move {
@@ -508,7 +592,7 @@ impl WebSink {
                     Some(content) => {
                         let mime = mime_guess::from_path(path_to_serve).first_or_octet_stream();
                         let body: Cow<'static, [u8]> = content.data;
-                        gst::debug!(CAT, "✅ Serving static asset: {} ({} bytes, mime: {})", 
+                        gst::debug!(CAT, "✅ Serving static asset: {} ({} bytes, mime: {})",
                                    path_to_serve, body.len(), mime.as_ref());
                         let response = warp::http::Response::builder()
                             .header("Content-Type", mime.as_ref())
@@ -535,15 +619,12 @@ impl WebSink {
 
     fn update_peer_connections(&self, peer_id: String, pc: Option<Arc<webrtc::peer_connection::RTCPeerConnection>>, add: bool) {
         gst::debug!(CAT, "🔄 Updating peer connections - peer: {}, add: {}", peer_id, add);
-        
+
         let mut state = self.state.lock().unwrap();
-        
+
         if add {
             if let Some(connection) = pc {
-                state.peer_connections.insert(peer_id.clone(), PeerConnection {
-                    peer_id: peer_id.clone(),
-                    connection,
-                });
+                state.peer_connections.insert(peer_id.clone(), connection);
                 gst::info!(CAT, "➕ Added peer connection: {}", peer_id);
             }
         } else {
@@ -553,11 +634,11 @@ impl WebSink {
                 gst::warning!(CAT, "⚠️ Tried to remove non-existent peer: {}", peer_id);
             }
         }
-        
+
         let count = state.peer_connections.len() as i32;
         self.num_peers.store(count, Ordering::SeqCst);
         gst::info!(CAT, "👥 Client count changed: {} connected clients", count);
-        
+
         // Send notification on peer change channel (non-blocking)
         if let Some(tx) = &state.unblock_tx {
             match tx.try_send(count) {
