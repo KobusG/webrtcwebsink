@@ -25,6 +25,7 @@ use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
@@ -165,7 +166,43 @@ async fn handle_session_request(
         if let Some(tx) = &state_guard.unblock_tx {
             let _ = tx.try_send(count);
         }
+        gst::info!(CAT, "👥 Added new peer connection, total count: {}", count);
     }
+
+    // Handle peer disconnection
+    let state_clone = Arc::clone(&state);
+    let session_id_clone = session_id.clone();
+    peer_connection.on_peer_connection_state_change(Box::new(move |s| {
+        gst::debug!(CAT, "🔄 Peer connection state changed to: {:?} for session {}", s, session_id_clone);
+
+        match s {
+            RTCPeerConnectionState::Disconnected |
+            RTCPeerConnectionState::Failed |
+            RTCPeerConnectionState::Closed => {
+                gst::info!(CAT, "🔌 Peer disconnected, removing session: {}", session_id_clone);
+
+                // Remove the peer connection from state
+                if let Ok(mut state_guard) = state_clone.lock() {
+                    state_guard.peer_connections.remove(&session_id_clone);
+
+                    // Update peer count and send notification
+                    let count = state_guard.peer_connections.len() as i32;
+                    if let Some(tx) = &state_guard.unblock_tx {
+                        let _ = tx.try_send(count);
+                    }
+
+                    gst::info!(CAT, "📊 Updated peer count to: {}", count);
+                } else {
+                    gst::error!(CAT, "❌ Failed to lock state for peer disconnection cleanup");
+                }
+            },
+            _ => {
+                gst::debug!(CAT, "🔄 Peer connection state: {:?}", s);
+            }
+        }
+
+        Box::pin(async {})
+    }));
 
     // Serialize answer to JSON
     let answer_json = serde_json::to_value(&final_answer)?;
@@ -458,13 +495,13 @@ impl BaseSinkImpl for WebSink {
         };
         let render_count = self.render_count.fetch_add(1, Ordering::Relaxed);
 
-        if render_count % 100 == 0 {
+        if render_count % 600 == 0 {
             gst::trace!(CAT, "🎬 Render called - buffer size: {} bytes, peers: {}", buffer.size(), num_peers);
         }
 
         // In live mode, we skip rendering if no peers are connected
         if is_live && num_peers == 0 {
-            if (render_count % 100) == 0 { gst::trace!(CAT, "⏭️ No peers connected in live mode, skipping buffer");}
+            if (render_count % 600) == 0 { gst::trace!(CAT, "⏭️ No peers connected in live mode, skipping buffer");}
             return Ok(gst::FlowSuccess::Ok);
         }
 
@@ -584,31 +621,6 @@ impl WebSink {
             warp::serve(routes).run(([0, 0, 0, 0], port)).await;
             gst::info!(CAT, "HTTP server on port {} stopped.", port);
         })
-    }
-
-    fn remove_peer_connection(&self, peer_id: &str) {
-        gst::debug!(CAT, "🔄 Removing peer connection: {}", peer_id);
-
-        let mut state = self.state.lock().unwrap();
-
-        if let Some(_) = state.peer_connections.remove(peer_id) {
-            gst::info!(CAT, "➖ Removed peer connection: {}", peer_id);
-        } else {
-            gst::warning!(CAT, "⚠️ Tried to remove non-existent peer: {}", peer_id);
-        }
-
-        let count = state.peer_connections.len() as i32;
-        gst::info!(CAT, "👥 Client count changed: {} connected clients", count);
-
-        // Send notification on peer change channel (non-blocking)
-        if let Some(tx) = &state.unblock_tx {
-            match tx.try_send(count) {
-                Ok(_) => gst::debug!(CAT, "📤 Sent peer count update ({}) via mpsc channel", count),
-                Err(e) => gst::warning!(CAT, "⚠️ Failed to send peer count update: {:?}", e),
-            }
-        } else {
-            gst::warning!(CAT, "⚠️ No mpsc sender available for peer count update");
-        }
     }
 }
 #[derive(Debug)]
