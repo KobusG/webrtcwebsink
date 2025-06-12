@@ -10,11 +10,11 @@ repository = "https://github.com/videologyinc/websink"
 [lib]
 name = "gstwebsink"
 crate-type = ["cdylib"]
-path = "rswebsink/lib.rs"
+path = "lib.rs"
 
 [[bin]]
 name = "test-rswebsink"
-path = "rswebsink/main.rs"
+path = "main.rs"
 
 [dependencies]
 gst = { package = "gstreamer", version = "0.23.6" }
@@ -42,3 +42,10 @@ failure = "0.1.8"
 
 [build-dependencies]
 gst-plugin-version-helper = "0.8.2"
+
+[profile.release]
+opt-level = 'z'     # Optimize for size
+lto = true          # Enable link-time optimization
+codegen-units = 3   # Reduce number of codegen units to increase optimizations
+panic = 'abort'     # Abort on panic
+strip = true        # Strip symbols from binary*

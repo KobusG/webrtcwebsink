@@ -1,7 +1,6 @@
 use gst::prelude::*;
 use failure::Error;
 use gst::glib;
-use clap::Parser;
 mod websink;
 // Import the plugin's registration function.
 // Assuming the library target is named `gstwebsink` as per Cargo.toml
@@ -14,16 +13,7 @@ mod websink;
 // For this test application, we'll rely on GStreamer finding the plugin
 // as if it were installed or `GST_PLUGIN_PATH` was set correctly.
 
-#[derive(clap::Parser)]
-#[command(version, about, long_about = None)]
-struct Arguments {
-    #[arg(short, long, default_value_t = false)]
-    /// Produces verbose logs.
-    verbose: bool,
-}
-
 fn main() {
-    let args = Arguments::parse();
     // Initialize GStreamer
     gst::init().expect("Failed to initialize gst_init");
 

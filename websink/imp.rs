@@ -81,7 +81,7 @@ impl Default for Settings {
 }
 
 #[derive(RustEmbed)]
-#[folder = "rswebsink/static/"] // Path relative to the Cargo.toml of the rswebsink crate
+#[folder = "static/"] // Path relative to the Cargo.toml of the rswebsink crate
 struct Asset;
 
 // Custom error for session handling
